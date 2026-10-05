@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    image: peer-review-assigner:latest
+    container_name: peer-review-assigner
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite database file; the directory below is backed by a named volume
+      # so batches stay readable across container restarts/recreations.
+      PEER_REVIEW_DB: /srv/app/data/peer_review.db
+    volumes:
+      - peer-review-data:/srv/app/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  peer-review-data:
