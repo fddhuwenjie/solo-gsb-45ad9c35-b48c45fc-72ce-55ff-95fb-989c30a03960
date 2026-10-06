@@ -378,6 +378,154 @@ def test_chained_publish_carries_surviving_confirmations_and_drops_revoked():
     assert state["confirmed"] == [{"manuscript_id": "m1", "reviewer_id": "r1"}]
 
 
+def _chain_payload():
+    """Two manuscripts, four reviewers: any two reviewers can cover the round.
+
+    Initial assignment minimises the max load ratio by spreading the two
+    slots (m1←r1, m2←r2). After r1 then r2 withdraw, the reassignments must
+    land on r3/r4 — the old behaviour reused the original reviewer list and
+    could send the m1 slot back to the already-withdrawn r1.
+    """
+    return {
+        "manuscripts": [
+            {"id": "m1", "topics": ["t"], "required_reviewers": 1},
+            {"id": "m2", "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "scores": {"t": 10}, "capacity": 2, "conflicts": []},
+            {"id": "r2", "scores": {"t": 9}, "capacity": 2, "conflicts": []},
+            {"id": "r3", "scores": {"t": 8}, "capacity": 2, "conflicts": []},
+            {"id": "r4", "scores": {"t": 7}, "capacity": 2, "conflicts": []},
+        ],
+    }
+
+
+def _pairs(body):
+    return [
+        (relation["manuscript_id"], relation["reviewer_id"])
+        for relation in body["assignments"]
+    ]
+
+
+def test_consecutive_withdrawals_keep_excluding_earlier_withdrawers():
+    _create(payload=_chain_payload())
+    first = client.post(
+        "/batches/b1/reassignments",
+        json={"version": 1, "withdrawn_reviewer_id": "r1"},
+    )
+    assert first.status_code == 201
+    assert _pairs(first.json()) == [("m1", "r3"), ("m2", "r2")]
+
+    state = client.get("/batches/b1").json()
+    assert state["version"] == 2
+    assert [reviewer["id"] for reviewer in state["input"]["reviewers"]] == [
+        "r2",
+        "r3",
+        "r4",
+    ]
+
+    second = client.post(
+        "/batches/b1/reassignments",
+        json={"version": 2, "withdrawn_reviewer_id": "r2"},
+    )
+    assert second.status_code == 201
+    body = second.json()
+    assert body["version"] == 3
+    # Neither earlier withdrawer may flow back into the new assignment.
+    assert _pairs(body) == [("m1", "r3"), ("m2", "r4")]
+    assert all(reviewer_id not in {"r1", "r2"} for _, reviewer_id in _pairs(body))
+
+    state = client.get("/batches/b1").json()
+    assert [reviewer["id"] for reviewer in state["input"]["reviewers"]] == ["r3", "r4"]
+    assert _pairs(state["assignment"]) == [("m1", "r3"), ("m2", "r4")]
+
+
+def test_consecutive_withdrawals_exclusion_survives_restart(tmp_path):
+    db = str(tmp_path / "chain.db")
+    storage.reset(db)
+    _create(payload=_chain_payload())
+    client.post(
+        "/batches/b1/reassignments",
+        json={"version": 1, "withdrawn_reviewer_id": "r1"},
+    )
+    client.post(
+        "/batches/b1/reassignments",
+        json={"version": 2, "withdrawn_reviewer_id": "r2"},
+    )
+
+    storage.reset(db)  # new container process reopens the same SQLite file
+
+    state = client.get("/batches/b1").json()
+    assert state["version"] == 3
+    assert [reviewer["id"] for reviewer in state["input"]["reviewers"]] == ["r3", "r4"]
+    assert _pairs(state["assignment"]) == [("m1", "r3"), ("m2", "r4")]
+
+
+def test_repeated_withdrawal_is_422_and_changes_nothing():
+    _create(payload=_chain_payload())
+    first = client.post(
+        "/batches/b1/reassignments",
+        json={"version": 1, "withdrawn_reviewer_id": "r1"},
+    )
+    assert first.status_code == 201
+
+    repeat = client.post(
+        "/batches/b1/reassignments",
+        json={"version": 2, "withdrawn_reviewer_id": "r1"},
+    )
+    assert repeat.status_code == 422
+
+    state = client.get("/batches/b1").json()
+    assert state["version"] == 2
+    assert [reviewer["id"] for reviewer in state["input"]["reviewers"]] == [
+        "r2",
+        "r3",
+        "r4",
+    ]
+    assert _pairs(state["assignment"]) == [("m1", "r3"), ("m2", "r2")]
+
+
+def test_infeasible_withdrawal_keeps_withdrawer_available_and_version():
+    # r3 capped at 1 cannot absorb both the m1 slot and m2 once r2 withdraws.
+    payload = _input_payload()
+    payload["reviewers"][2]["capacity"] = 1
+    _create(payload=payload)
+    client.post(
+        "/batches/b1/confirmations",
+        json={"version": 1, "relations": [{"manuscript_id": "m1", "reviewer_id": "r1"}]},
+    )
+    failed = client.post(
+        "/batches/b1/reassignments",
+        json={"version": 2, "withdrawn_reviewer_id": "r2"},
+    )
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "infeasible"
+
+    # The failed withdrawal is not recorded: r2 stays available and the
+    # attempt may be retried, or a different reviewer may withdraw.
+    state = client.get("/batches/b1").json()
+    assert state["version"] == 2
+    assert [reviewer["id"] for reviewer in state["input"]["reviewers"]] == [
+        "r1",
+        "r2",
+        "r3",
+    ]
+
+    # Withdrawing the actually-feasible reviewer r3 works next and still
+    # keeps r2 (never successfully withdrawn) available.
+    other = client.post(
+        "/batches/b1/reassignments",
+        json={"version": 2, "withdrawn_reviewer_id": "r3"},
+    )
+    # Original m1←{r1,r3}, m2←r2 with m1←r1 confirmed: removing r3 frees an
+    # m1 slot that no one but r3 can serve (r1 is the manuscript, r2 only
+    # scores nlp/vision) — report feasibility result without pinning it; the
+    # point below is the state contract on the prior failed withdrawal.
+    assert other.status_code in (200, 201)
+    after = client.get("/batches/b1").json()
+    assert "r2" in {reviewer["id"] for reviewer in after["input"]["reviewers"]}
+
+
 # ---------------------------------------------------------------------------
 # Optimistic concurrency: only one mutating request per version succeeds
 # ---------------------------------------------------------------------------
@@ -467,7 +615,14 @@ def test_state_survives_storage_reconnect(tmp_path):
 
     state = client.get("/batches/b1").json()
     assert state["version"] == 3
-    assert state["input"] == _input_payload()
+    # The successful withdrawal is part of the batch state: the stored
+    # reviewer set is exactly the currently available reviewers.
+    expected_input = _input_payload()
+    expected_input["reviewers"] = [
+        reviewer for reviewer in expected_input["reviewers"] if reviewer["id"] != "r2"
+    ]
+    assert state["input"] == expected_input
+    assert [reviewer["id"] for reviewer in state["input"]["reviewers"]] == ["r1", "r3"]
     assert [(a["manuscript_id"], a["reviewer_id"]) for a in state["assignment"]["assignments"]] == [
         ("m1", "r1"),
         ("m1", "r3"),

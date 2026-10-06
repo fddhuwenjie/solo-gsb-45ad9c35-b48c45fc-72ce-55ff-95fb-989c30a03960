@@ -1,10 +1,18 @@
 """Persistent, versioned review batches.
 
-A batch stores the original solver input (manuscripts and reviewers), the
-complete assignment of its current version, and the relations that have been
-confirmed on that version. Creation reuses :func:`app.solver.assign`;
-publishing a withdrawal reuses :func:`app.solver.reassign` with the batch's
-own original relations and confirmation records.
+A batch stores the original manuscripts, its *currently available*
+reviewers, the complete assignment of its current version, and the relations
+that have been confirmed on that version. Creation reuses
+:func:`app.solver.assign`; publishing a withdrawal reuses
+:func:`app.solver.reassign` with the batch's own original relations and
+confirmation records.
+
+Only the successful publisher of a withdrawal mutates the batch: that
+reviewer is removed from the batch's reviewer set together with the new
+assignment, so later withdrawals keep solving against the remaining
+reviewers and an earlier withdrawer can never flow back into a new
+assignment. Repeating the withdrawal of an already-withdrawn reviewer is an
+:class:`InvalidBatchRequest`.
 
 Optimistic concurrency: every mutation carries the version the caller read.
 Confirms and publishes execute inside one serialised ``BEGIN IMMEDIATE``
@@ -194,8 +202,12 @@ def register_confirmation(batch_id: str, payload: BatchConfirmationRequest) -> d
 def publish_reassignment(batch_id: str, payload: BatchReassignmentRequest) -> dict:
     """Run the existing reassign solver; commit only a feasible result.
 
-    On infeasibility the transaction rolls back (via :class:`Rollback`) so the
-    batch, its confirmations and its version remain exactly as read.
+    A feasible result is published together with the withdrawal itself: the
+    withdrawer is removed from the batch's available reviewers, so every
+    later withdrawal keeps solving against the remaining set and an earlier
+    withdrawer can never be re-assigned. On infeasibility the transaction
+    rolls back (via :class:`Rollback`) so the batch, its reviewer set, its
+    confirmations and its version remain exactly as read.
     """
     try:
         with write_transaction() as conn:
@@ -209,8 +221,11 @@ def publish_reassignment(batch_id: str, payload: BatchReassignmentRequest) -> di
             manuscripts, reviewers = to_domain(input_payload)
             reviewer_ids = {reviewer.id for reviewer in reviewers}
             if payload.withdrawn_reviewer_id not in reviewer_ids:
+                # Covers both unknown ids and reviewers that withdrew in an
+                # earlier version: only the batch's currently available
+                # reviewers stay in its stored input.
                 raise InvalidBatchRequest(
-                    f"退出者 {payload.withdrawn_reviewer_id} 不在批次评审人列表中"
+                    f"退出者 {payload.withdrawn_reviewer_id} 不在批次当前可用评审人列表中"
                 )
 
             assignment = json.loads(row["assignment"])
@@ -254,6 +269,16 @@ def publish_reassignment(batch_id: str, payload: BatchReassignmentRequest) -> di
             # revoked relations) carry into the new version.
             surviving = [pair for pair in confirmed if pair in new_pairs]
 
+            # Commit the withdrawal itself: the withdrawer leaves the batch's
+            # available reviewers, so subsequent withdrawals keep solving
+            # without every earlier successful withdrawer.
+            remaining_input = dict(input_payload)
+            remaining_input["reviewers"] = [
+                reviewer
+                for reviewer in input_payload["reviewers"]
+                if reviewer["id"] != payload.withdrawn_reviewer_id
+            ]
+
             conn.execute(
                 "DELETE FROM confirmations WHERE batch_id = ?", (batch_id,)
             )
@@ -263,8 +288,9 @@ def publish_reassignment(batch_id: str, payload: BatchReassignmentRequest) -> di
                 [(batch_id, m_id, r_id) for m_id, r_id in surviving],
             )
             conn.execute(
-                "UPDATE batches SET assignment = ?, version = ? WHERE id = ?",
+                "UPDATE batches SET input = ?, assignment = ?, version = ? WHERE id = ?",
                 (
+                    json.dumps(remaining_input, ensure_ascii=False),
                     json.dumps(result, ensure_ascii=False),
                     row["version"] + 1,
                     batch_id,

@@ -298,7 +298,12 @@ curl -s -X POST http://localhost:8000/reassign \
 - **改派发布**：评审人退出时，服务端以**批次内当前版本的原关系**与**确认记录**
   调用现有 `/reassign` 求解：撤销退出者的关系及其确认，其他确认随版本保留，
   把完整改派连同 `revoked`/`added` 发布为下一版本（`201 Created`）。
-  改派无解时返回 `200` + `{"status": "infeasible", ...}`，**批次、确认与版本均不变**。
+  **只有完整改派成功才会写入退出状态与新分派**：成功退出者随即从批次
+  **当前可用评审人**中移除（`GET` 返回的 `input.reviewers` 即剩余可用评审人，
+  重启后依然有效），因此**连续退出**时后续改派会持续排除先前已成功退出的评审人，
+  旧退出者不会被重新派回。对已退出者再次发起退出属于非法请求，返回 `422`。
+  改派无解时返回 `200` + `{"status": "infeasible", ...}`，**批次、可用评审人、
+  确认与版本均不变**（退出状态也不写入，可用相同版本重试）。
 
 ### 1. 创建批次 `POST /batches`
 
@@ -352,8 +357,9 @@ curl -s -X POST http://localhost:8000/batches \
 curl -s http://localhost:8000/batches/batch-2026-10
 ```
 
-返回当前 `input`（创建时的稿件/评审人）、`assignment`（当前版本的完整分派）、
-`confirmed`（已确认关系）与 `version`；批次不存在返回 `404`。
+返回 `input`（创建时的稿件输入与**当前可用评审人**——已成功退出的评审人会从
+`reviewers` 中移除）、`assignment`（当前版本的完整分派）、`confirmed`（已确认关系）
+与 `version`；批次不存在返回 `404`。
 
 ### 3. 登记确认 `POST /batches/{batch_id}/confirmations`
 
@@ -407,15 +413,68 @@ curl -s -X POST http://localhost:8000/batches/batch-2026-10/reassignments \
 ```
 
 此后 `GET /batches/batch-2026-10` 看到的分派即新版本，m1←r1 的确认继续保留，
-退出者 r2 的关系与其确认被撤销。若改派无解，返回 `200`：
+退出者 r2 的关系与其确认被撤销，且 r2 已从 `input.reviewers` 移除。若改派无解，返回 `200`：
 
 ```json
 {"status": "infeasible", "reason": "退出者撤销后，剩余评审人无法满足全部稿件需求",
  "batch_id": "batch-2026-10", "version": 2}
 ```
 
-此时批次分派、确认与版本都保持原状（仍为版本 2，可用相同版本重试）。版本过期返回
-`409` 与 `current_version`；退出者不在批次评审人列表中返回 `422`。
+此时批次分派、可用评审人、确认与版本都保持原状（仍为版本 2，退出状态也不写入，
+可用相同版本重试）。版本过期返回 `409` 与 `current_version`；退出者不在批次
+**当前可用**评审人列表中（未知 ID，或对先前已成功退出者的重复退出）返回 `422`。
+
+### 5. 连续退出示例（旧退出者不回流）
+
+要点：每次成功发布后，退出者都会从批次当前可用评审人中移除；下一次退出以新版本
+号继续调用**同一接口**即可，求解时只会考虑剩余评审人，先前退出者不可能被重新派回。
+
+以「m1、m2 各需 1 名评审人，r1/r2/r3/r4 容量均为 2」为例，初始最优分派为
+m1←r1、m2←r2：
+
+```bash
+# r1 先退出（v1 -> v2）：m1 改派给 r3
+curl -s -X POST http://localhost:8000/batches/batch-2026-10/reassignments \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "withdrawn_reviewer_id": "r1"}'
+
+# r2 接着退出（携带新版本 v2 -> v3）：m2 改派给 r4，m1 仍由 r3 评审；
+# 即便 r1 对 m1 的匹配分更高，r1 已成功退出，不会被重新派回
+curl -s -X POST http://localhost:8000/batches/batch-2026-10/reassignments \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 2, "withdrawn_reviewer_id": "r2"}'
+```
+
+第二次发布成功后 `GET /batches/batch-2026-10`：
+
+```json
+{
+  "version": 3,
+  "input": {
+    "manuscripts": ["…稿件不变…"],
+    "reviewers": [
+      {"id": "r3", "scores": {"t": 8}, "capacity": 2, "conflicts": []},
+      {"id": "r4", "scores": {"t": 7}, "capacity": 2, "conflicts": []}
+    ]
+  },
+  "assignment": {
+    "status": "feasible",
+    "assignments": [
+      {"manuscript_id": "m1", "reviewer_id": "r3", "score": 8.0},
+      {"manuscript_id": "m2", "reviewer_id": "r4", "score": 7.0}
+    ]
+  },
+  "confirmed": []
+}
+```
+
+对已退出的 r1 再发起退出（携带 v3）会得到 `422`：
+
+```json
+{"detail": {"message": "退出者 r1 不在批次当前可用评审人列表中"}}
+```
+
+该排除关系随批次写入 SQLite，**容器重启后连续退出仍然有效**。
 
 ### 持久化与并发说明
 
@@ -449,7 +508,9 @@ curl -s -X POST http://localhost:8000/batches/batch-2026-10/reassignments \
   （JSON），`confirmations` 表保存当前版本的确认关系；每次写操作在
   `BEGIN IMMEDIATE` 事务中完成「读版本 → 校验/求解 → 写新版本」，以进程内锁与
   SQLite 写事务串行化并发请求，实现同一版本仅一个请求生效的乐观并发控制。
-  改派无解时回滚事务，批次、确认与版本均不变。
+  改派无解时回滚事务，批次、确认与版本均不变。成功发布退出时在同一事务内把退出者
+  从批次 `input.reviewers` 中删除并写入新分派，使连续退出持续排除先前的退出者；
+  该状态与其他批次数据一起持久化，重启后依旧生效。
 
 ## 本地开发（不用 Docker）
 

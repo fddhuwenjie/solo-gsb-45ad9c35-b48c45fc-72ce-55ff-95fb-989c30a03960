@@ -353,7 +353,10 @@ class BatchStateResponse(BaseModel):
 
     batch_id: str = Field(description="批次 ID")
     version: int = Field(description="当前版本（初始为 1，每次确认/发布递增）")
-    input: AssignRequest = Field(description="创建批次时传入的稿件与评审人输入")
+    input: AssignRequest = Field(
+        description="创建批次时传入的稿件与评审人输入；成功退出的评审人会从"
+        " reviewers 中移除，故查询时 reviewers 即批次当前可用评审人"
+    )
     assignment: FeasibleResponse = Field(description="当前版本的完整分派")
     confirmed: list[AssignmentRelation] = Field(
         description="当前版本已登记确认的关系，按 (稿件 ID, 评审人 ID) 排序"
